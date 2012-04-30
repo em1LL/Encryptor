@@ -1,6 +1,8 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/interprocess/file_mapping.hpp>
+#include <boost/interprocess/mapped_region.hpp>
 #include <boost/program_options.hpp>
 #include <algorithm>
 #include <cassert>
@@ -12,174 +14,129 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "MakeString.h"
+#include "Logger.h"
+#include "Settings.h"
 
 namespace fs = boost::filesystem;
+namespace ip = boost::interprocess;
 namespace po = boost::program_options;
 
-void renameFile(boost::filesystem::path& filename)
-{
-	// String full of valid characters for file naming
-	const std::string temp_data = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.";
+auto getLogger = Logger::getInstance();
+auto getSettings = Settings::getInstance();
 
-	std::string stem = filename.stem().string();
-	const std::string extension = filename.extension().string();
-
-	// Encrypt filename
-	for (
-		std::string::size_type i = 0
-		, stem_size = stem.size()
-		, temp_data_size = temp_data.size()
-		; i < stem_size
-		; ++i
-		)
-	{
-		auto pos = temp_data.find(stem[i], 0);
-		if (pos != std::string::npos)
-		{
-			/// \todo Tricky code better to have as a separate function w/ unit-tests
-			/// \note But particularly this part better to replace w/ lookup table
-			stem[i] = temp_data.at(temp_data_size - 1 - pos);
-		}
-		/// \bug Have u ever think about non English letters in filenames? :)
-		/// What do u think would heppened?
-		/// \todo Fix this nasty bug :)
-	}
-
-	filename = stem + extension;
-}
-
-int main(int argc, char *argv[])
+void parseCmdLine(int argc, char *argv[])
 {
 	// Receiving params from command line using boost::program_options
 	po::options_description description("Allowed options");
 	description.add_options()
 		("help,h", "Produce help message")
-		("filename,f", po::value<std::string>(), "Set 'filename'")
-		("code,c", po::value<std::string>(), "Set 'code'")
-		("rename,r", "Encrypt name of file")
-		("interactive,i", "Interactive mode");
+		("filename,f", po::value<std::string>()->default_value(""), "Set 'filename'")
+		("code,c", po::value<std::string>()->default_value(""), "Set 'code'")
+		("rename,r", po::value<std::string>()->default_value(""), "Set new filename")
+		("log,l", po::value<std::string>()->default_value("stderr"), "Set log destination");
 
 	po::variables_map options; // Our params will be stored here
 	try
 	{
 		po::store(po::parse_command_line(argc, argv, description), options); // Trying to parse command line arguments
 	}
+	// Missing arguments and syntax errors
+	catch (const po::invalid_command_line_syntax &inv_syntax)
+	{
+		switch (inv_syntax.kind())
+		{
+		case po::invalid_syntax::missing_parameter:
+			getLogger->log(MakeString() << "*** Missing argument for option '" << inv_syntax.tokens() << "'.\n");
+			break;
+		default:
+			getLogger->log(MakeString() << "*** Syntax error, kind " << int(inv_syntax.kind()) << '\n');
+		};
+	}
+	// Unknown options
+	catch (const po::unknown_option &unkn_opt)
+	{
+		getLogger->log(MakeString() << "*** Unknown option '" << unkn_opt.get_option_name() << "'\n");
+	}
+	// Trying to catch any other exception
 	catch (const std::exception& e)
 	{
-		std::cerr << "*** Error: An error occurred while parsing command line params: " << e.what() << std::endl;
-		return EXIT_FAILURE;
+		getLogger->log(MakeString() << "*** Unknown error occurred while parsing command line params: " << e.what() << '\n');
 	}
 
 	// If there are no params or user tried to showing help message
-	if (options.empty() || options.count("help"))
+	if (options.count("help"))
 	{
 		std::cout << description << std::endl;
-		return EXIT_FAILURE;
+		exit(EXIT_FAILURE);
 	}
 
-	const std::string filename_arg = options["filename"].as<std::string>(); // Name of file to be encrypted
-	const std::string code_arg = options["code"].as<std::string>(); // Code word to encrypt file
-	/// \todo Add a real params validation code here
-	assert(
-		"After this point all input params expected to be valid" &&
-		filename_arg.size() &&  // expect non empty filename
-		code_arg.size() // expect non empty key string
-		);
+	getSettings->setFilename(options["filename"].as<std::string>());
+	getSettings->setCode(options["code"].as<std::string>());
+	getSettings->setNewFilename(options["rename"].as<std::string>());
+	getLogger->setDestination(options["log"].as<std::string>());
 
-	fs::path filename(filename_arg);
-	/// \todo Reduce scope of the input stream instance
-	/// The rule is: release any resource (delete instance) when it doesn't needed anymore...
-	fs::ifstream f_in;
-	f_in.exceptions(std::ios_base::failbit | std::ios_base::badbit);
-
-	/// \note Better to use a container w/ contiguous memory guarantee,
-	/// to avoid reallocations
-	std::vector<char> data;                                 // Input data container
-	size_t size = 0;                                        // Set to zero for future check...
-	try
+	if (!getSettings->getFilename().size() ||
+		!getSettings->getCode().size())
 	{
-		/// \todo Check if file size is bigger than some threshold
-		/// it would be better to do the job using blocks...
-		/// \attention Never use seek+tell+seek back to detect file size!
-		/// The correct way to get file size is to use \e stat(2)!
-		size = fs::file_size(filename);      // Get file size
-		/// \todo The rest has meaning only for files w/ some content,
-		/// otherwise (file size == 0) there is nothing to do...
-		assert("Implementation required for empty files!" && size);
-		data.resize(size);                                  // Preallocate a buffer for file's data
-		f_in.open(filename, std::ios::binary);                 // Keep std::ios::binary flag to support some special sequences like new-line characters
-		f_in.read(&data[0], size);                             // Get whole file into memory
-		f_in.close();
+		getLogger->log(MakeString() << "*** Implementation required for empty files");
 	}
-	/// \note Catch as \c sed::exception, cuz \c boost::filesystem::file_size may throw as well
-	catch (const std::exception& e)
+}
+
+void encryptFile()
+{
+	fs::path filename(getSettings->getFilename());
+
+	// Is file empty?
+	if (fs::is_empty(filename))
 	{
-		std::cerr << "*** Error: An error occurred while opening / reading data from file: "
-			<< e.what() << std::endl;
-		return EXIT_FAILURE;
+		getLogger->log(MakeString() << "*** Implementation required for empty files");
 	}
-	assert("Sanity (paranoid) check" && size && !data.empty());
+
+	//Create a file mapping
+	ip::file_mapping m_file(filename.string().c_str(), ip::read_write);
+
+	//Map the whole file with read-write permissions in this process
+	ip::mapped_region region(m_file, ip::read_write);
+
+	//Get the address of the mapped region
+	char * const data = static_cast <char*> (region.get_address());
+	const std::size_t file_size = region.get_size();
+
+	const std::string code_temp = getSettings->getCode();
 
 	/// \todo Better to unroll this loop a little manually to gain some performance!
 	for (
 		std::string::size_type i = 0
 		, j = 0
-		, code_size = code_arg.size()           // NOTE avoid to calculate size on every iteration...
-		; i < size
+		, code_size = getSettings->getCode().size()           // NOTE avoid to calculate size on every iteration...
+		; i < file_size
 		; ++i
 		/// \todo Candidate for <em>"extract method"</em> refactoring
 		, j = (++j == code_size) ? 0 : j
 		)
 	{
-		data[i] ^= code_arg[j];                                 // THE MAIN (DAMN TRICKY ALGORITHM :)
+		data[i] ^= code_temp[j];                                 // THE MAIN (DAMN TRICKY ALGORITHM :)
 	}
 
-	if (options.count("rename"))
+	std::cout << "Bytes encrypted: " << file_size << std::endl;
+}
+
+void renameFile()
+{
+	if (getSettings->getNewFilename().size())
 	{
-		renameFile(filename);
-		std::cout << std::left << std::setw(18) << "New filename: " << filename << std::endl;
+		fs::rename(getSettings->getFilename(), getSettings->getNewFilename());
 	}
+}
 
-	std::cout << std::left << std::setw(18) << "Bytes encrypted: " << size << std::endl;
+int main(int argc, char *argv[])
+{
+	parseCmdLine(argc, argv);
 
-	if (fs::exists(filename) && options.count("interactive"))
-	{
-		std::cout << "File associated with name " << filename << " already exists. Do you want to continue anyway? Y/N ";
+	encryptFile();
 
-		for (char c = std::cin.get(); c != 'Y'; c = std::cin.get())
-		{
-			std::cout << "As u wish commander... :)\n";
-			return EXIT_FAILURE;
-		}
-	}
-
-	/// \todo This would work but there is some 'problems' possible:
-	/// file open could be really slooooow in some circumstances... so,
-	/// if there wasn't rename operation requested, better to reuse already opened file...
-	/// \todo And again: reduce scope of the output stream instance...
-	fs::ofstream f_out;
-	f_out.exceptions(std::ios_base::failbit | std::ios_base::badbit);
-
-	try
-	{
-		assert("Stream expected to be valid at this point" && f_out.good());
-		f_out.open(filename, std::ios::binary);
-		f_out.write(data.data(), size);                         // Write whole data at once
-		f_out.close();
-	}
-	catch (const std::exception& e)
-	{
-		std::cerr << "*** Error: An error occurred while opening / write data to file: "
-			<< e.what() << std::endl;
-		return EXIT_FAILURE;
-	}
-
-	// If our old filename does not equal to new filename, trying to delete old unencrypted file
-	if (filename != filename_arg && !fs::remove(filename_arg))
-	{
-		std::cerr << "An error occurred while deleting file" << std::endl;
-		return EXIT_FAILURE;
-	}
+	renameFile();
 
 	return EXIT_SUCCESS;
 }

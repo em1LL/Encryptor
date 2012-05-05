@@ -1,3 +1,5 @@
+// MakeString.h
+
 #ifndef MAKESTRING_H
 #define MAKESTRING_H
 
